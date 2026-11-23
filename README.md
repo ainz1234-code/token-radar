@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/token-radar-01/ainz1234-code/token-radar/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 [![reward](https://make.fun/badge/token-radar-01/ainz1234-code/token-radar/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 
-A token launch radar for DeFi protocols that record no token yet. It prices each one by what the market pays for the snapshot's own live tokens with the same TVL and category (a ridge/Huber fit, checked on held-out tokens), adjusts for the week's TVL growth and how long the protocol has run without a token, and gives every row a farm plan with its chain, deposit, fees, time and expected drop. One file, `dashboard/model.js`, is the model for both `main.ts` (which writes `board.json`) and the static page.
+A token launch radar for DeFi protocols that record no token yet. It prices each one by what the market pays for the snapshot's own live tokens with the same TVL and kind (a ridge/Huber fit, checked on two blind tests: 5-fold held-out and walk-forward), adjusts for the week's TVL growth and how long the protocol has run without a token, and gives every row a farm plan with its chain, deposit, fees, time, expected drop and a Farm / Thin / Skip verdict weighted by how often its peers carry a token. One file, `dashboard/model.js`, is the model for both `main.ts` (which writes `board.json`) and the static page.
 
 ## Run it
 
