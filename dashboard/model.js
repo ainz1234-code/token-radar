@@ -1,25 +1,12 @@
 /* Token Radar model, radar-cal-2.
  *
- * One file, two readers: main.ts runs it in Node to write board.json, and the page runs the very same
- * code in the browser, so every number on screen is recomputed from the snapshot's raw fields.
- *
- * The question: if a protocol's record stayed as it is, what would its token be worth?
- * The snapshot itself answers it: 128 of its protocols already have a trading token with a market cap.
- * We fit how the market prices those tokens from the same figures every protocol carries, then apply the
- * fit to the protocols that record no token yet.
- *
- *   core:     ln(mcap) = b0 + b1 ln(TVL) + family                    (fitted on the live tokens)
- *   implied = exp(core) x growth factor x track-record factor           (stated priors, bounded)
- *
- * The core is fitted by ridge-regularised, Huber-weighted least squares; family offsets are shrunk to
- * zero by 12 pseudo-protocols. Two blind tests on the live tokens pick it: 5-fold held-out, and a
- * walk-forward that fits the oldest 60% by listing day and prices the newest 40%. Per-category offsets,
- * and growth and age fitted as slopes, each won the first test and lost the second (the validation table
- * shows it), so the category offsets were dropped and growth and age enter as bounded priors on how
- * durable the TVL is, not as fitted slopes. The 5-fold errors give the band beside every implied value:
- *   growth factor       = (1 + g)^0.5, g = 7-day TVL change clamped to -40%..+60%  -> x0.77..x1.26
- *   track-record factor = 0.75 + 0.25 x min(days with no token, 3 years) / 3 years -> x0.75..x1.00
- * No protocol name is ever special-cased: the same functions score every row.
+ * main.ts runs this file in Node to write board.json; the page runs the same file in the browser.
+ * What would a token be worth if the protocol's record stayed as it is? Price it like the snapshot's
+ * 128 live tokens with the same figures:
+ *   core:    ln(mcap) = b0 + b1 ln(TVL) + family     (ridge + Huber fit on live tokens, family shrunk)
+ *   implied = exp(core) x (1+g7d)^0.5 x (0.75 + 0.25 x min(years with no token, 3)/3)
+ * Category offsets and fitted growth/age slopes won the 5-fold test but lost walk-forward, so growth
+ * and time without a token enter as bounded priors. No protocol name is special-cased.
  */
 (function (root) {
   'use strict';
@@ -29,11 +16,14 @@
   var RIDGE = 2;          // pull on the three slopes (features are centred)
   var FAMILY_PRIOR = 12;  // pseudo-protocols at zero offset behind each family effect
   var FOLDS = 5;
-  var AIRDROP_SHARE = 0.075; // share of a launch value assumed to go to users who farmed it
-  var GROWTH_POWER = 0.5;     // half of the snapshot week's TVL move is taken to persist
-  var GROWTH_CLAMP = [-40, 60];
-  var RECORD_FLOOR = 0.75;    // a brand-new protocol keeps 75% of the calibrated value
-  var RECORD_YEARS = 3;       // ... rising to 100% after three years with no token
+  // The stated assumptions. board.json uses these defaults; the page's sandbox may override them.
+  var DEFAULTS = {
+    share: 0.075,     // share of a launch value assumed to go to users who farmed it
+    growthPower: 0.5, // half of the snapshot week's TVL move is taken to persist
+    recordFloor: 0.75 // a brand-new protocol keeps 75% of the calibrated value, 100% after 3 years
+  };
+  var S = DEFAULTS;
+  var GROWTH_CLAMP = [-40, 60], RECORD_YEARS = 3;
 
   // Categories grouped by how a reader would farm them and how the market prices them.
   var FAMILY = {
@@ -58,7 +48,6 @@
   var NATIVE = { Bitcoin: 'BTC', Bittensor: 'TAO', Ripple: 'XRP', Cardano: 'ADA', TON: 'TON', Stellar: 'XLM', Litecoin: 'LTC',
     Doge: 'DOGE', Tron: 'USDT', Sui: 'SUI', Solana: 'SOL', Aptos: 'APT', Near: 'NEAR', Noble: 'USDC', Starknet: 'STRK', Flare: 'FLR' };
 
-  /** How a protocol stands on token: live (trades, has a market cap), recorded (no market cap), pre-token. */
   function tokenStatus(p) {
     if (p.mcap_usd != null && p.mcap_usd > 0) return 'live';
     if (p.gecko_id != null || p.symbol != null) return 'recorded';
@@ -88,7 +77,6 @@
 
   function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
 
-  /** The three numeric features, before centring. Missing values take the calibration median. */
   function rawFeatures(p, asOf, fill) {
     var age = ageDays(p, asOf);
     var g = p.change_7d == null ? fill.growth : clamp(p.change_7d, -60, 150);
@@ -109,7 +97,6 @@
     return s[lo] + (s[hi] - s[lo]) * (pos - lo);
   }
 
-  /** Solve A x = b by Gaussian elimination with partial pivoting (A is small and well conditioned). */
   function solve(A, b) {
     var n = b.length, M = A.map(function (row, i) { return row.concat([b[i]]); });
     for (var c = 0; c < n; c++) {
@@ -130,7 +117,6 @@
     return x;
   }
 
-  /** Weighted ridge regression of y on centred X (intercept unpenalised). */
   function ridgeFit(X, y, w) {
     var d = X[0].length + 1, A = [], b = [];
     for (var i = 0; i < d; i++) { A.push(new Array(d).fill(0)); b.push(0); }
@@ -145,10 +131,7 @@
     return solve(A, b);
   }
 
-  /**
-   * Fit the valuation on protocols whose token trades. `opts.featureMask` switches slopes off, which the
-   * validation uses to show what each term adds; `opts.groups` false drops the family offsets.
-   */
+  // Fit on live tokens; featureMask switches slopes off and groups:false drops the family offsets (for the tests).
   function fit(live, asOf, opts) {
     opts = opts || {};
     var mask = opts.featureMask || [1, 0, 0]; // the core: TVL slope only, growth and age enter as priors
@@ -182,7 +165,6 @@
     return out;
   }
 
-  /** The log value and each term's share of it, for one protocol. */
   function predictLog(model, p) {
     var raw = rawFeatures(p, model.asOf, model.fill);
     var x = raw.map(function (v, j) { return (v - model.centre[j]) * model.mask[j]; });
@@ -195,20 +177,17 @@
     return { logV: core + terms.growth + terms.record, terms: terms };
   }
 
-  /** ln of the growth factor: half of the snapshot week's clamped TVL move persists. */
   function growthPrior(p) {
     var g = p.change_7d == null ? 0 : clamp(p.change_7d, GROWTH_CLAMP[0], GROWTH_CLAMP[1]);
-    return GROWTH_POWER * Math.log(1 + g / 100);
+    return S.growthPower * Math.log(1 + g / 100);
   }
 
-  /** ln of the track-record factor: TVL held longer with no token is TVL that has proven it stays. */
   function recordPrior(p, asOf) {
     var age = ageDays(p, asOf);
     var years = age == null ? RECORD_YEARS / 2 : Math.min(age / 365.25, RECORD_YEARS);
-    return Math.log(RECORD_FLOOR + (1 - RECORD_FLOOR) * years / RECORD_YEARS);
+    return Math.log(S.recordFloor + (1 - S.recordFloor) * years / RECORD_YEARS);
   }
 
-  /** Implied value in whole dollars, with the held-out 80% band. */
   function value(model, p) {
     var r = predictLog(model, p);
     var v = Math.max(1, Math.round(Math.exp(r.logV)));
@@ -228,7 +207,6 @@
     return 1 - 6 * d2 / (n * (n * n - 1));
   }
 
-  /** k-fold held-out test on the live tokens, fold = position in slug order mod k. */
   function crossValidate(live, asOf, opts) {
     var sorted = live.slice().sort(function (a, b) { return a.slug < b.slug ? -1 : 1; });
     var errs = [], pred = [], act = [], rows = [];
@@ -249,10 +227,7 @@
       q10: quantile(errs, 0.1), q90: quantile(errs, 0.9), rows: rows };
   }
 
-  /**
-   * Walk-forward test: fit on the oldest 60% of live tokens by listing day, price the newest 40%. A
-   * pre-token protocol is usually younger than the tokens that price it, so this is the harder blind test.
-   */
+  // Walk-forward: fit the oldest 60% of live tokens by listing day, price the newest 40% (pre-token protocols are young).
   function walkForward(live, asOf, opts) {
     var dated = live.slice().sort(function (a, b) {
       var x = a.listed_at || '0000', y = b.listed_at || '0000';
@@ -269,7 +244,6 @@
     return { n: abs.length, medianMissX: Math.exp(median(abs)), rho: spearman(pred, act), from: dated[cut].listed_at };
   }
 
-  /** The validation table: the full model beside simpler ones, each tested on held-out tokens. */
   function validation(live, asOf) {
     var variants = [
       { key: 'tvl', label: 'TVL only', opts: { featureMask: [1, 0, 0], groups: false } },
@@ -284,11 +258,8 @@
     });
   }
 
-  /**
-   * Peer token rate: of the snapshot's protocols in the same family and of a similar age, the share that
-   * already carries a token on record. Shrunk toward the whole snapshot's rate. It is no forecast of a
-   * launch; it weights a farm plan's expected drop by how often protocols like this one have a token.
-   */
+  // Peer token rate: share of same-family, similar-age protocols with a token on record, shrunk to the overall rate.
+  // No launch forecast: it only weights a farm plan's expected drop.
   function peerRates(protocols, asOf) {
     var fam = {}, age = {}, all = { t: 0, n: 0 };
     function bucket(p) { var d = ageDays(p, asOf); return d == null ? 'unknown' : d < 365 ? '<1y' : d < 730 ? '1-2y' : d < 1461 ? '2-4y' : '4y+'; }
@@ -339,7 +310,6 @@
     'Other': { asset: 'USDC', txs: 5, setup: 30, act: function (n) { return 'Use ' + n + '’s main product with a modest balance and repeat the core action weekly; with no comparable playbook, breadth over weeks beats size in one day.'; } }
   };
 
-  /** Main chain to farm on: the cheapest of the first three chains the protocol's TVL sits on. */
   function farmChain(p) {
     var cands = (p.chains || []).slice(0, 3);
     if (!cands.length) return { chain: 'its main chain', tx: TX_DEFAULT };
@@ -348,7 +318,6 @@
     return { chain: best, tx: TX_COST[best] != null ? TX_COST[best] : TX_DEFAULT };
   }
 
-  /** A farm plan with what it costs and how long it takes, worked out from the row's own numbers. */
   function farmPlan(p, v, asOf, odds) {
     if (odds == null) odds = 0.5;
     var fam = familyOf(p.category), book = PLAYBOOK[fam] || PLAYBOOK.Other;
@@ -362,7 +331,7 @@
     else if (native === 'USDT' || native === 'USDC') asset = native;
     else if (native) asset = native;
     var cycleCost = ch.tx * (book.txs + 2); // + funding hop and the claim
-    var per1k = v.implied * AIRDROP_SHARE * 1000 / p.tvl_usd;
+    var per1k = v.implied * S.share * 1000 / p.tvl_usd;
     var apr = per1k / 1000 * 365 / hold;
     var deposit = niceDeposit(cycleCost / (0.05 * per1k / 1000)); // fees at most 5% of the expected drop
     var expected = per1k * deposit / 1000;
@@ -377,7 +346,7 @@
       'Check first (5 min): confirm on ' + p.name + '’s own site that it still has no token and that a points or rewards programme is live. The snapshot (' + asOf + ') records no token; if one has launched, skip the plan.',
       'Fund (' + Math.round(book.setup / 2) + ' min, about ' + money(ch.tx * 2) + '): move ' + money(deposit) + ' of ' + asset + ' to ' + ch.chain + '. That size keeps the whole cycle’s fees (' + money(cycleCost) + ' for ' + (book.txs + 2) + ' transactions at ~' + money(ch.tx) + ' each) under 5% of the expected drop.',
       'Position (' + Math.round(book.setup / 2) + ' min, about ' + money(ch.tx * book.txs / 2) + '): ' + book.act(p.name),
-      'Hold ' + hold + ' days, checking weekly (5 min): at the model’s ' + (AIRDROP_SHARE * 100) + '% user share of a ' + money(v.implied) + ' launch, every $1,000 kept in all season earns about ' + money(per1k) + ', near ' + (apr * 100).toFixed(1) + '% a year on top of the base yield; ' + money(deposit) + ' expects about ' + money(expected) + '.',
+      'Hold ' + hold + ' days, checking weekly (5 min): at the model’s ' + +(S.share * 100).toFixed(1) + '% user share of a ' + money(v.implied) + ' launch, every $1,000 kept in all season earns about ' + money(per1k) + ', near ' + (apr * 100).toFixed(1) + '% a year on top of the base yield; ' + money(deposit) + ' expects about ' + money(expected) + '.',
       'Exit rule: withdraw if TVL drops more than 25% in a week (it moved ' + (g >= 0 ? '+' : '') + g.toFixed(1) + '% in the snapshot week), if the protocol pauses withdrawals, or if a token launches with no user allocation. Leaving costs about ' + money(ch.tx * 2) + '.',
       'After a launch: claim inside the claim window (one transaction, ~' + money(ch.tx) + '), and judge the price against the implied ' + money(v.implied) + ' (band ' + money(v.low) + ' to ' + money(v.high) + ') before you sell or keep.'
     ];
@@ -386,8 +355,9 @@
       odds: odds, aprAdj: aprAdj, net: net, verdict: verdict };
   }
 
-  /** The whole radar from a snapshot: the fit, its validation, the ranked board and the set-aside lists. */
-  function buildRadar(snapshot) {
+  function buildRadar(snapshot, assumptions) {
+    S = {};
+    Object.keys(DEFAULTS).forEach(function (k) { S[k] = assumptions && assumptions[k] != null ? assumptions[k] : DEFAULTS[k]; });
     var asOf = snapshot.as_of, watch = {};
     snapshot.watchlist.forEach(function (s) { watch[s] = true; });
     var live = [], recorded = [], pre = [], aside = [];
@@ -425,6 +395,16 @@
           net_usd: Math.round(plan.net), verdict: plan.verdict },
         farm_steps: plan.steps };
     });
+    // Rank range: where the row would land if its value sat at either end of its 80% band, others fixed.
+    board.forEach(function (r) {
+      var above = 0, atOrAbove = 0;
+      board.forEach(function (o) {
+        if (o === r) return;
+        if (o.implied_value_usd > r.implied_high_usd) above++;
+        if (o.implied_value_usd >= r.implied_low_usd) atOrAbove++;
+      });
+      r.rank_range = [above + 1, atOrAbove + 1];
+    });
     return { model: model, validation: checks, board: board, live: live, recorded: recorded, aside: aside, peers: peers };
   }
 
@@ -434,7 +414,7 @@
     return o;
   }
 
-  root.RadarModel = { MODEL_ID: MODEL_ID, AIRDROP_SHARE: AIRDROP_SHARE, TX_COST: TX_COST, FAMILY: FAMILY,
+  root.RadarModel = { MODEL_ID: MODEL_ID, DEFAULTS: DEFAULTS, settings: function () { return S; }, TX_COST: TX_COST, FAMILY: FAMILY,
     familyOf: familyOf, tokenStatus: tokenStatus, setAsideReason: setAsideReason, ageDays: ageDays,
     fit: fit, value: value, predictLog: predictLog, validation: validation, farmPlan: farmPlan, peerRates: peerRates,
     buildRadar: buildRadar, money: money };

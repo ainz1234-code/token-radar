@@ -9,15 +9,27 @@
   // Rebuild the snapshot from its column form, then run the model on it.
   var snapshot = { as_of: D.as_of, source: D.source, floor_usd: D.floor_usd, watchlist: D.watchlist,
     protocols: D.protocols.map(function (row) { var p = {}; D.fields.forEach(function (f, i) { p[f] = row[i]; }); return p; }) };
-  var R = M.buildRadar(snapshot);
-  var rows = R.board, bySlug = {};
-  rows.forEach(function (r) { bySlug[r.slug] = r; });
-  var agree = rows.filter(function (r) { return D.board_values[r.slug] === r.implied_value_usd; }).length;
-  var used = R.validation[R.validation.length - 1];
-  var money = M.money;
+  var R, rows, bySlug, agree, used, money = M.money;
+  // (Re)run the model; the sandbox passes its own assumptions, board.json was written with the defaults.
+  function compute() {
+    var sb = {}, custom = false;
+    Object.keys(M.DEFAULTS).forEach(function (k) { sb[k] = state[k]; if (state[k] !== M.DEFAULTS[k]) custom = true; });
+    R = M.buildRadar(snapshot, sb);
+    rows = R.board; bySlug = {};
+    rows.forEach(function (r) { bySlug[r.slug] = r; });
+    agree = rows.filter(function (r) { return D.board_values[r.slug] === r.implied_value_usd; }).length;
+    used = R.validation[R.validation.length - 1];
+    document.getElementById('meta').innerHTML =
+      '<span>Snapshot <b class="num">' + esc(D.as_of) + '</b> · DefiLlama protocols</span><span>Model <b class="num">' + esc(M.MODEL_ID) + '</b></span>' +
+      (custom ? '<span class="agree bad">sandbox assumptions: not board.json</span>' :
+        '<span class="agree' + (agree === rows.length ? '' : ' bad') + '" title="Implied values recomputed in this page vs board.json">page = board.json ' + agree + '/' + rows.length + '</span>');
+  }
 
-  var DEFAULTS = { tab: 'board', q: '', family: '', chain: '', scope: 'all', move: 'any', verdict: '', minTvl: 0, sort: 'rank', dir: 1, detail: '' };
+  var DEFAULTS = { tab: 'board', q: '', family: '', chain: '', scope: 'all', move: 'any', verdict: '', minTvl: 0, sort: 'rank', dir: 1, detail: '', pins: '',
+    share: M.DEFAULTS.share, growthPower: M.DEFAULTS.growthPower, recordFloor: M.DEFAULTS.recordFloor };
+  var NUMERIC = { minTvl: 1, dir: 1, share: 1, growthPower: 1, recordFloor: 1 };
   var state = JSON.parse(JSON.stringify(DEFAULTS));
+  function pins() { return state.pins ? state.pins.split(',') : []; }
 
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); }
   function pct(x, d) { return x == null ? '—' : (x >= 0 ? '+' : '') + x.toFixed(d == null ? 1 : d) + '%'; }
@@ -29,7 +41,7 @@
     location.hash.replace(/^#/, '').split('&').forEach(function (kv) {
       var i = kv.indexOf('='); if (i < 0) return;
       var k = decodeURIComponent(kv.slice(0, i)), v = decodeURIComponent(kv.slice(i + 1));
-      if (k in state) state[k] = (k === 'minTvl' || k === 'dir') ? Number(v) : v;
+      if (k in state) state[k] = NUMERIC[k] ? Number(v) : v;
     });
   }
   function writeHash() {
@@ -39,12 +51,6 @@
     });
     try { history.replaceState(null, '', parts.length ? '#' + parts.join('&') : location.pathname); } catch (e) { /* some file:// hosts refuse it */ }
   }
-
-  // ---- header and summary ----
-  document.getElementById('meta').innerHTML =
-    '<span>Snapshot <b class="num">' + esc(D.as_of) + '</b> · DefiLlama protocols</span>' +
-    '<span>Model <b class="num">' + esc(M.MODEL_ID) + '</b></span>' +
-    '<span class="agree' + (agree === rows.length ? '' : ' bad') + '" title="Implied values recomputed in this page vs board.json">page = board.json ' + agree + '/' + rows.length + '</span>';
 
   function hero() {
     var watch = rows.filter(function (r) { return r.watchlist; }).length;
@@ -78,7 +84,7 @@
   function kpi(v, label) { return '<div class="kpi"><b>' + v + '</b><span>' + label + '</span></div>'; }
 
   function tabs() {
-    return '<nav class="tabs">' + [['board', 'Board'], ['model', 'Model & validation'], ['aside', 'Token already trades / set aside']].map(function (t) {
+    return '<nav class="tabs">' + [['board', 'Board'], ['compare', 'Compare pinned (' + pins().length + ')'], ['model', 'Model & sandbox'], ['aside', 'Token already trades / set aside']].map(function (t) {
       return '<button data-tab="' + t[0] + '" class="' + (state.tab === t[0] ? 'on' : '') + '">' + t[1] + '</button>';
     }).join('') + '</nav>';
   }
@@ -101,6 +107,7 @@
     var list = rows.filter(function (r) {
       if (state.scope === 'watch' && !r.watchlist) return false;
       if (state.scope === 'early' && r.watchlist) return false;
+      if (state.scope === 'pinned' && pins().indexOf(r.slug) < 0) return false;
       if (state.family && r.family !== state.family) return false;
       if (state.chain && r.chains.indexOf(state.chain) < 0) return false;
       if (state.move === 'up' && !(r.change_7d > 0)) return false;
@@ -114,10 +121,11 @@
     return list.sort(function (a, b) { var x = key(a), y = key(b); return (x < y ? -1 : x > y ? 1 : a.rank - b.rank) * dir; });
   }
 
-  function options(values, current, all) {
-    return '<option value="">' + all + '</option>' + values.map(function (v) {
-      return '<option' + (v === current ? ' selected' : '') + ' value="' + esc(v) + '">' + esc(v) + '</option>';
-    }).join('');
+  // A filter select bound to one state key: [value, label] pairs.
+  function pick(label, key, opts) {
+    return '<label>' + label + '<select data-key="' + key + '">' + opts.map(function (o) {
+      return '<option value="' + esc(o[0]) + '"' + (state[key] === o[0] ? ' selected' : '') + '>' + esc(o[1]) + '</option>';
+    }).join('') + '</select></label>';
   }
 
   function board() {
@@ -129,17 +137,14 @@
     function pos(v) { return Math.max(0, Math.min(100, (Math.log(v) - minLog) / (maxLog - minLog) * 100)); }
     var html = '<div class="filters">' +
       '<label>Search<input id="f-q" placeholder="Name, category or chain" value="' + esc(state.q) + '"></label>' +
-      '<label>Family<select id="f-family">' + options(fams, state.family, 'All families') + '</select></label>' +
-      '<label>Chain<select id="f-chain">' + options(chains, state.chain, 'All chains') + '</select></label>' +
-      '<label>Min TVL<select id="f-min">' + [[0, 'Any'], [1e7, '$10M+'], [5e7, '$50M+'], [2e8, '$200M+'], [1e9, '$1B+']].map(function (o) {
-        return '<option value="' + o[0] + '"' + (state.minTvl === o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; }).join('') + '</select></label>' +
-      '<label>7-day TVL<select id="f-move">' + [['any', 'Any'], ['up', 'Growing'], ['down', 'Shrinking']].map(function (o) {
-        return '<option value="' + o[0] + '"' + (state.move === o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; }).join('') + '</select></label>' +
-      '<label>Verdict<select id="f-verdict">' + [['', 'Any'], ['Farm', 'Farm'], ['Thin', 'Thin'], ['Skip', 'Skip']].map(function (o) {
-        return '<option value="' + o[0] + '"' + (state.verdict === o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; }).join('') + '</select></label>' +
-      '<label>Scope<div class="seg">' + [['all', 'All ' + rows.length], ['watch', 'Watchlist'], ['early', 'Below floor']].map(function (o) {
+      pick('Family', 'family', [['', 'All families']].concat(fams.map(function (f) { return [f, f]; }))) +
+      pick('Chain', 'chain', [['', 'All chains']].concat(chains.map(function (c) { return [c, c]; }))) +
+      pick('Min TVL', 'minTvl', [[0, 'Any'], [1e7, '$10M+'], [5e7, '$50M+'], [2e8, '$200M+'], [1e9, '$1B+']]) +
+      pick('7-day TVL', 'move', [['any', 'Any'], ['up', 'Growing'], ['down', 'Shrinking']]) +
+      pick('Verdict', 'verdict', [['', 'Any'], ['Farm', 'Farm'], ['Thin', 'Thin'], ['Skip', 'Skip']]) +
+      '<label>Scope<div class="seg">' + [['all', 'All ' + rows.length], ['watch', 'Watchlist'], ['early', 'Below floor'], ['pinned', '★ ' + pins().length]].map(function (o) {
         return '<button data-scope="' + o[0] + '" class="' + (state.scope === o[0] ? 'on' : '') + '">' + o[1] + '</button>'; }).join('') + '</div></label>' +
-      '<span class="count">' + list.length + ' of ' + rows.length + ' rows' + (list.length < rows.length ? '<a data-reset>reset</a>' : '') + '</span></div>';
+      '<span class="count">' + list.length + ' of ' + rows.length + ' rows' + (list.length < rows.length ? '<a data-reset>reset</a>' : '') + '<a data-csv>CSV ↓</a></span></div>';
     html += '<div class="table"><table><thead><tr>' + COLS.map(function (c) {
       var on = state.sort === c[0];
       return '<th data-sort="' + c[0] + '" class="' + c[2] + (on ? ' sorted' : '') + '">' + c[1] + (on ? (state.dir > 0 ? ' ▾' : ' ▴') : '') + '</th>';
@@ -147,7 +152,7 @@
     html += list.map(function (r) {
       var lo = pos(r.implied_low_usd), hi = pos(r.implied_high_usd);
       return '<tr data-slug="' + esc(r.slug) + '" class="' + (state.detail === r.slug ? 'sel' : '') + '">' +
-        '<td class="r num dim">' + r.rank + '</td>' +
+        '<td class="r num dim"><span class="pin' + (pins().indexOf(r.slug) >= 0 ? ' on' : '') + '" data-pin="' + esc(r.slug) + '" title="Pin to compare">★</span>' + r.rank + '</td>' +
         '<td><span class="pname">' + esc(r.name) + '</span>' + badges(r) + '<div class="psub">' + esc(r.category || 'Uncategorised') + ' · ' + esc(r.chains.slice(0, 3).join(', ')) + (r.chains.length > 3 ? ' +' + (r.chains.length - 3) : '') + '</div></td>' +
         '<td class="r num">' + money(r.tvl_usd) + '</td>' +
         '<td class="r num ' + (r.change_7d > 0 ? 'up' : r.change_7d < 0 ? 'down' : '') + '">' + pct(r.change_7d) + '</td>' +
@@ -187,8 +192,10 @@
       ['Track record: ' + dur(r.days_without_token) + ' with no token', t.record]
     ];
     var cmp = comparables(r);
-    return '<button class="close" data-close>Close ✕</button>' +
-      '<h2>' + esc(r.name) + badges(r) + '</h2><div class="psub">' + esc(r.category || 'Uncategorised') + ' · ' + esc(r.chains.join(', ')) + ' · rank ' + r.rank + ' of ' + rows.length + '</div>' +
+    var pinned = pins().indexOf(r.slug) >= 0;
+    return '<button class="close" data-close>Close ✕</button><button class="close" data-pin="' + esc(r.slug) + '">' + (pinned ? '★ Pinned' : '☆ Pin to compare') + '</button>' +
+      '<h2>' + esc(r.name) + badges(r) + '</h2><div class="psub">' + esc(r.category || 'Uncategorised') + ' · ' + esc(r.chains.join(', ')) + ' · rank ' + r.rank + ' of ' + rows.length +
+      ' (' + r.rank_range[0] + '–' + r.rank_range[1] + ' across its band)</div>' +
       '<div class="big"><b>' + money(r.implied_value_usd) + '</b><span class="dim">80% band ' + money(r.implied_low_usd) + ' – ' + money(r.implied_high_usd) + ' · ' + (r.value_to_tvl * 100).toFixed(1) + '% of TVL</span></div>' +
       '<div class="facts"><div><b>' + money(r.tvl_usd) + '</b><span>TVL</span></div><div><b class="' + (r.change_7d >= 0 ? 'up' : 'down') + '">' + pct(r.change_7d, 2) + '</b><span>7-day TVL</span></div>' +
       '<div><b>' + dur(r.days_without_token) + '</b><span>listed, no token</span></div><div><b>' + esc(r.token_status) + '</b><span>token on record</span></div></div>' +
@@ -209,7 +216,7 @@
 
   // ---- model & validation ----
   function modelTab() {
-    var m = R.model, rowsCv = used.rows || [];
+    var m = R.model, rowsCv = used.rows || [], st = M.settings();
     var lo = 12, hi = 25, W = 520, H = 300, P = 34;
     function sx(v) { return P + (Math.log(v) - lo) / (hi - lo) * (W - P - 8); }
     function sy(v) { return H - P - (Math.log(v) - lo) / (hi - lo) * (H - P - 8); }
@@ -225,16 +232,73 @@
       '<text x="' + (W - 6) + '" y="' + (H - 4) + '" text-anchor="end">held-out predicted mcap →</text></svg>';
     var fams = Object.keys(m.family).sort(function (a, b) { return m.family[b] - m.family[a]; });
     return '<div class="grid2"><div class="card"><h3>The model, ' + esc(M.MODEL_ID) + '</h3><div class="formula">core     ln(mcap) = ' + m.beta[0].toFixed(2) + ' + ' + m.beta[1].toFixed(3) + '·(ln TVL − ' + m.centre[0].toFixed(2) + ') + family\n' +
-      'implied  = e^core × (1 + g₇d)^0.5 × (0.75 + 0.25·min(years with no token, 3)/3)\nband     = implied × e^[' + m.band[0].toFixed(2) + ', ' + m.band[1].toFixed(2) + ']  (10th–90th pct of held-out errors)</div>' +
-      '<p class="note">Fitted on the ' + R.live.length + ' snapshot protocols whose token trades (market cap on record), with ridge and Huber weights; family offsets are shrunk toward zero by 12 pseudo-protocols. g₇d is clamped to −40%…+60%. A TVL slope of ' + m.beta[1].toFixed(2) + ' means value grows slower than TVL: 10× the TVL buys ' + Math.pow(10, m.beta[1]).toFixed(1) + '× the value. Airdrop share for farm plans: ' + (M.AIRDROP_SHARE * 100) + '% of the implied value.</p>' +
+      'implied  = e^core × (1 + g₇d)^' + st.growthPower + ' × (' + st.recordFloor + ' + ' + +(1 - st.recordFloor).toFixed(2) + '·min(years with no token, 3)/3)\nband    = implied × e^[' + m.band[0].toFixed(2) + ', ' + m.band[1].toFixed(2) + ']  (10th–90th pct of held-out errors)</div>' +
+      '<p class="note">Fitted on the ' + R.live.length + ' live tokens (ridge + Huber; family shrunk by 12 pseudo-protocols; g₇d clamped to −40%…+60%). Slope ' + m.beta[1].toFixed(2) + ': 10× the TVL buys ' + Math.pow(10, m.beta[1]).toFixed(1) + '× the value.</p>' + sandbox() +
       '<h3>Two blind tests on live tokens</h3><table class="cmp num"><tr class="dim"><td>Model</td><td class="r">5-fold miss</td><td class="r">ρ</td><td class="r">walk-fwd miss</td><td class="r">ρ</td></tr>' +
       R.validation.map(function (v) { return '<tr' + (v === used ? ' style="color:var(--amber)"' : '') + '><td>' + esc(v.label) + '</td><td class="r">×' + v.medianMissX.toFixed(2) + '</td><td class="r">' + v.rho.toFixed(2) + '</td><td class="r">×' + v.wfMissX.toFixed(2) + '</td><td class="r">' + v.wfRho.toFixed(2) + '</td></tr>'; }).join('') +
-      '</table><p class="note">5-fold: each token priced by a fit that never saw it. Walk-forward: fit on tokens listed before ' + esc(used.wfFrom) + ', priced the ' + used.wfN + ' listed since, as a pre-token protocol is younger than its comparables. Per-category offsets, and growth and age fitted as slopes, each won the first test and lost the second: overfit. So only family offsets stay, and growth and time without a token enter as bounded priors on how durable the TVL is, which cost almost nothing on either test.</p></div>' +
+      '</table><p class="note">Walk-forward: fit on tokens listed before ' + esc(used.wfFrom) + ', priced the ' + used.wfN + ' listed since (pre-token protocols are young). Category offsets and fitted growth/age slopes won 5-fold, lost walk-forward: overfit. So growth and time without a token enter as bounded priors.</p></div>' +
       '<div class="card"><h3>Held-out predictions vs actual market cap</h3>' + svg + '<p class="note">Each dot is a live token priced by a model that never saw it. Dashed: perfect; shaded: within 3×.</p>' +
       '<h3>Family offsets (× on value)</h3>' + fams.map(function (k) {
         var v = m.family[k], w = Math.min(100, Math.abs(v) * 80);
         return '<div class="hbar"><span>' + esc(k) + '</span><i style="width:' + w + '%;background:' + (v >= 0 ? 'var(--green)' : 'var(--red)') + '"></i><span class="num r">' + mult(v) + '</span></div>';
       }).join('') + '</div></div>';
+  }
+
+  // The three stated assumptions, live: values, ranks, plans and verdicts are all recomputed by model.js.
+  function sandbox() {
+    var top = rows.slice(0, 3).map(function (r) { return esc(r.name) + ' ' + money(r.implied_value_usd); }).join(', ');
+    var farm = rows.filter(function (r) { return r.farm.verdict === 'Farm'; }).length;
+    return '<h3>Sandbox: change an assumption, the whole board re-runs</h3>' + [
+      ['share', 'Airdrop share to farmers', 0.025, 0.15, 0.005, function (v) { return +(v * 100).toFixed(1) + '%'; }],
+      ['growthPower', 'Share of the week’s TVL move that persists', 0, 1, 0.1, function (v) { return Math.round(v * 100) + '%'; }],
+      ['recordFloor', 'Value kept by a brand-new protocol', 0.5, 1, 0.05, function (v) { return Math.round(v * 100) + '%'; }]
+    ].map(function (s) {
+      return '<label class="sb"><span>' + s[1] + '</span><input type="range" id="sb-' + s[0] + '" min="' + s[2] + '" max="' + s[3] + '" step="' + s[4] + '" value="' + state[s[0]] + '"><b class="num">' + s[5](state[s[0]]) + '</b></label>';
+    }).join('') + '<p class="note">Now: top three ' + top + '; ' + farm + ' plans rate Farm. board.json keeps the defaults' +
+      (agree === rows.length ? '.' : ' (<a data-sbreset>restore them</a>).') + '</p>';
+  }
+
+  // ---- compare pinned ----
+  function compareTab() {
+    var list = pins().map(function (s) { return bySlug[s]; }).filter(Boolean);
+    if (!list.length) return '<p class="empty">Pin rows with ★ on the board, or from a protocol’s detail view, to compare them side by side.</p>';
+    var lines = [
+      ['Rank (band range)', function (r) { return r.rank + ' (' + r.rank_range[0] + '–' + r.rank_range[1] + ')'; }],
+      ['Implied value', function (r) { return money(r.implied_value_usd); }],
+      ['80% band', function (r) { return money(r.implied_low_usd) + ' – ' + money(r.implied_high_usd); }],
+      ['TVL · 7d', function (r) { return money(r.tvl_usd) + ' · ' + pct(r.change_7d); }],
+      ['No token for', function (r) { return dur(r.days_without_token); }],
+      ['Family', function (r) { return esc(r.family); }],
+      ['Verdict', function (r) { return verdictTag(r.farm.verdict); }],
+      ['Risk-weighted yield', function (r) { return (r.farm.risk_adjusted_apr * 100).toFixed(1) + '%/yr'; }],
+      ['Deposit · fees', function (r) { return money(r.farm.deposit_usd) + ' · ' + money(r.farm.cycle_cost_usd); }],
+      ['Net after fees', function (r) { return money(r.farm.net_usd); }],
+      ['Chain · hold', function (r) { return esc(r.farm.chain) + ' · ' + r.farm.hold_days + 'd'; }]
+    ];
+    return '<div class="table"><table class="num"><thead><tr><th></th>' + list.map(function (r) {
+      return '<th data-slug="' + esc(r.slug) + '">' + esc(r.name) + ' <span class="pin on" data-pin="' + esc(r.slug) + '">✕</span></th>';
+    }).join('') + '</tr></thead><tbody>' + lines.map(function (l) {
+      return '<tr><td class="dim">' + l[0] + '</td>' + list.map(function (r) { return '<td>' + l[1](r) + '</td>'; }).join('') + '</tr>';
+    }).join('') + '</tbody></table></div>';
+  }
+
+  function csv() {
+    var cols = ['rank', 'slug', 'name', 'category', 'tvl_usd', 'change_7d', 'days_without_token', 'implied_value_usd', 'implied_low_usd', 'implied_high_usd'];
+    var text = cols.concat(['rank_best', 'rank_worst', 'verdict', 'deposit_usd', 'cycle_cost_usd', 'risk_adjusted_apr']).join(',') + '\n' +
+      filtered().map(function (r) {
+        return cols.map(function (c) { return r[c]; }).concat([r.rank_range[0], r.rank_range[1], r.farm.verdict, r.farm.deposit_usd, r.farm.cycle_cost_usd, r.farm.risk_adjusted_apr])
+          .map(function (v) { v = v == null ? '' : String(v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }).join(',');
+      }).join('\n');
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv' }));
+    a.download = 'token-radar-' + D.as_of + '.csv';
+    a.click();
+  }
+
+  function togglePin(slug) {
+    var p = pins(), i = p.indexOf(slug);
+    if (i >= 0) p.splice(i, 1); else p.push(slug);
+    set({ pins: p.slice(-6).join(',') });
   }
 
   // ---- set aside and live ----
@@ -250,7 +314,7 @@
 
   // ---- render and events ----
   function render() {
-    var body = state.tab === 'model' ? modelTab() : state.tab === 'aside' ? asideTab() : board();
+    var body = state.tab === 'model' ? modelTab() : state.tab === 'aside' ? asideTab() : state.tab === 'compare' ? compareTab() : board();
     app.innerHTML = hero() + tabs() + body;
     var r = bySlug[state.detail];
     drawer.hidden = scrim.hidden = !r;
@@ -261,21 +325,21 @@
   function set(patch) { Object.keys(patch).forEach(function (k) { state[k] = patch[k]; }); render(); }
 
   app.addEventListener('click', function (e) {
-    var t = e.target.closest('[data-tab],[data-scope],[data-sort],[data-slug],[data-reset]');
+    var t = e.target.closest('[data-pin],[data-csv],[data-sbreset],[data-tab],[data-scope],[data-sort],[data-slug],[data-reset]');
     if (!t) return;
-    if (t.dataset.tab) set({ tab: t.dataset.tab });
+    if (t.dataset.pin) togglePin(t.dataset.pin);
+    else if ('csv' in t.dataset) csv();
+    else if ('sbreset' in t.dataset) { Object.keys(M.DEFAULTS).forEach(function (k) { state[k] = M.DEFAULTS[k]; }); compute(); render(); }
+    else if (t.dataset.tab) set({ tab: t.dataset.tab });
     else if (t.dataset.scope) set({ scope: t.dataset.scope });
     else if (t.dataset.sort) set(state.sort === t.dataset.sort ? { dir: -state.dir } : { sort: t.dataset.sort, dir: 1 });
     else if (t.dataset.slug) set({ detail: t.dataset.slug });
     else if ('reset' in t.dataset) set({ q: '', family: '', chain: '', scope: 'all', move: 'any', verdict: '', minTvl: 0 });
   });
   app.addEventListener('change', function (e) {
-    var id = e.target.id, v = e.target.value;
-    if (id === 'f-family') set({ family: v });
-    if (id === 'f-chain') set({ chain: v });
-    if (id === 'f-min') set({ minTvl: Number(v) });
-    if (id === 'f-move') set({ move: v });
-    if (id === 'f-verdict') set({ verdict: v });
+    var id = e.target.id, v = e.target.value, key = e.target.dataset.key, patch = {};
+    if (key) { patch[key] = NUMERIC[key] ? Number(v) : v; set(patch); }
+    if (id.indexOf('sb-') === 0) { state[id.slice(3)] = Number(v); compute(); render(); }
   });
   app.addEventListener('input', function (e) {
     if (e.target.id !== 'f-q') return;
@@ -286,9 +350,13 @@
   });
   function closeDrawer() { set({ detail: '' }); }
   scrim.addEventListener('click', closeDrawer);
-  drawer.addEventListener('click', function (e) { if (e.target.closest('[data-close]')) closeDrawer(); });
+  drawer.addEventListener('click', function (e) {
+    var pin = e.target.closest('[data-pin]');
+    if (pin) togglePin(pin.dataset.pin); else if (e.target.closest('[data-close]')) closeDrawer();
+  });
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && state.detail) closeDrawer(); });
 
   readHash();
+  compute();
   render();
 })();
